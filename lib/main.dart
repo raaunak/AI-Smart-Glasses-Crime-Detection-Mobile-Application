@@ -63,6 +63,19 @@ class PoseDetection {
   });
 }
 
+// Blueprint for one detected weapon/threat object
+class ThreatDetection {
+  final String label;
+  final double confidence;
+  final Rect box; // Coordinates scaled 0..640
+
+  ThreatDetection({
+    required this.label,
+    required this.confidence,
+    required this.box,
+  });
+}
+
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
 
@@ -78,6 +91,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   // AI State Variables
   Interpreter? _poseInterpreter;
+  Interpreter? _threatInterpreter;
+  List<ThreatDetection> _currentThreats = [];
+  static const List<String> _threatLabels = ['handgun', 'knife', 'weapon'];
   bool _isAiLoaded = false;
   bool _isBusyInferring = false;
   List<PoseDetection> _currentDetections = [];
@@ -154,19 +170,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Future<void> _loadAiModel() async {
     try {
-      final interpreter = await Interpreter.fromAsset(
+      // 1. Load Pose Model
+      final poseInterp = await Interpreter.fromAsset(
         'assets/models/yolo26n-pose.tflite',
       );
+      // 2. Load Custom Threat Model
+      final threatInterp = await Interpreter.fromAsset(
+        'assets/models/best_yolo26n_threat.tflite',
+      );
 
-      final inputShape = interpreter.getInputTensor(0).shape;
-      final outputShape = interpreter.getOutputTensor(0).shape;
+      final poseOut = poseInterp.getOutputTensor(0).shape;
+      final threatOut = threatInterp.getOutputTensor(0).shape;
 
       setState(() {
-        _poseInterpreter = interpreter;
+        _poseInterpreter = poseInterp;
+        _threatInterpreter = threatInterp;
         _isAiLoaded = true;
       });
 
-      _addLog('🧠 AI Loaded! Input: $inputShape | Output: $outputShape');
+      _addLog('🧠 Dual AI Ready! Pose: $poseOut | Threat: $threatOut');
     } catch (e) {
       _addLog('❌ AI Load Error: $e');
     }
@@ -261,13 +283,103 @@ class _DashboardScreenState extends State<DashboardScreen> {
         if (found.length >= 3) break;
       }
 
+      // 5. Run Custom Threat Object Detection on the same 640x640 inputBuffer
+      final List<ThreatDetection> foundThreats = [];
+      if (_threatInterpreter != null) {
+        final tShape = _threatInterpreter!.getOutputTensor(0).shape;
+        // tShape is typically [1, 7, 8400] (4 box coords + 3 classes) or [1, 300, 6]
+        final int dim1 = tShape[1];
+        final int dim2 = tShape[2];
+
+        final threatOutput = List.generate(
+          1,
+          (_) => List.generate(dim1, (_) => List<double>.filled(dim2, 0.0)),
+        );
+
+        _threatInterpreter!.run(inputBuffer.buffer, threatOutput);
+        final tMatrix = threatOutput[0];
+
+        // Case A: Standard YOLO shape [1, 4 + numClasses, 8400]
+        if (dim2 == 8400) {
+          final int numClasses = dim1 - 4;
+          for (int i = 0; i < 8400; i++) {
+            double maxConf = 0.0;
+            int bestClass = 0;
+            for (int c = 0; c < numClasses; c++) {
+              final double score = tMatrix[4 + c][i];
+              if (score > maxConf) {
+                maxConf = score;
+                bestClass = c;
+              }
+            }
+            if (maxConf < 0.40) continue;
+
+            double cx = tMatrix[0][i];
+            double cy = tMatrix[1][i];
+            double w = tMatrix[2][i];
+            double h = tMatrix[3][i];
+            if (cx <= 1.5 && cy <= 1.5 && w <= 1.5 && h <= 1.5) {
+              cx *= 640;
+              cy *= 640;
+              w *= 640;
+              h *= 640;
+            }
+            final rect = Rect.fromLTRB(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
+            if (foundThreats.any((t) => t.box.overlaps(rect))) continue;
+
+            final label = bestClass < _threatLabels.length
+                ? _threatLabels[bestClass]
+                : 'threat_$bestClass';
+            foundThreats.add(ThreatDetection(label: label, confidence: maxConf, box: rect));
+            if (foundThreats.length >= 3) break;
+          }
+        }
+        // Case B: YOLO26 End-to-End NMS-Free shape [1, 300, 6] ([x1, y1, x2, y2, conf, classId])
+        else if (dim2 == 6) {
+          for (int i = 0; i < dim1; i++) {
+            final double conf = tMatrix[i][4];
+            if (conf < 0.40) continue;
+            double x1 = tMatrix[i][0];
+            double y1 = tMatrix[i][1];
+            double x2 = tMatrix[i][2];
+            double y2 = tMatrix[i][3];
+            final int clsId = tMatrix[i][5].round();
+            if (x2 <= 1.5 && y2 <= 1.5) {
+              x1 *= 640;
+              y1 *= 640;
+              x2 *= 640;
+              y2 *= 640;
+            }
+            final label = clsId < _threatLabels.length
+                ? _threatLabels[clsId]
+                : 'threat_$clsId';
+            foundThreats.add(
+              ThreatDetection(
+                label: label,
+                confidence: conf,
+                box: Rect.fromLTRB(x1, y1, x2, y2),
+              ),
+            );
+          }
+        }
+      }
+
       stopwatch.stop();
       if (!mounted) return;
 
       setState(() {
         _currentDetections = found;
+        _currentThreats = foundThreats;
         _lastInferenceMs = stopwatch.elapsedMilliseconds;
       });
+
+      if (foundThreats.isNotEmpty) {
+        final topThreat = foundThreats.first;
+        _addLog(
+          '🚨 WEAPON DETECTED: ${topThreat.label.toUpperCase()} (${(topThreat.confidence * 100).toStringAsFixed(0)}%) in ${_lastInferenceMs}ms',
+        );
+        _triggerAdaptiveBurst();
+      }
 
       if (found.isNotEmpty) {
         _addLog(
@@ -413,6 +525,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void dispose() {
     _poseInterpreter?.close();
+    _threatInterpreter?.close();
     _burstTimer?.cancel();
     _controller?.dispose();
     super.dispose();
@@ -639,7 +752,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             fit: StackFit.expand,
             children: [
               CameraPreview(_controller!),
-              CustomPaint(painter: SkeletonPainter(_currentDetections)),
+              CustomPaint(painter: SkeletonPainter(_currentDetections, _currentThreats)),
             ],
           ),
         ),
@@ -720,7 +833,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
 // Draws the green bounding box and cyan skeleton joints over the camera preview
 class SkeletonPainter extends CustomPainter {
   final List<PoseDetection> detections;
-  SkeletonPainter(this.detections);
+  final List<ThreatDetection> threats;
+  SkeletonPainter(this.detections, this.threats);
 
   static const List<List<int>> bones = [
     [5, 6], [5, 7], [7, 9], [6, 8], [8, 10], // Shoulders, Elbows, Wrists
@@ -777,6 +891,36 @@ class SkeletonPainter extends CustomPainter {
           );
         }
       }
+    }
+
+    final threatPaint = Paint()
+      ..color = Colors.redAccent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0;
+
+    for (final threat in threats) {
+      final scaledBox = Rect.fromLTRB(
+        threat.box.left * scaleX,
+        threat.box.top * scaleY,
+        threat.box.right * scaleX,
+        threat.box.bottom * scaleY,
+      );
+      canvas.drawRect(scaledBox, threatPaint);
+
+      final textSpan = TextSpan(
+        text: ' ${threat.label.toUpperCase()} ${(threat.confidence * 100).toStringAsFixed(0)}% ',
+        style: const TextStyle(
+          color: Colors.white,
+          backgroundColor: Colors.redAccent,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+        ),
+      );
+      final textPainter = TextPainter(
+        text: textSpan,
+        textDirection: TextDirection.ltr,
+      )..layout();
+      textPainter.paint(canvas, Offset(scaledBox.left, scaledBox.top - 18));
     }
   }
 
